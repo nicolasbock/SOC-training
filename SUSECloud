@@ -1,0 +1,99 @@
+#!/bin/bash
+#
+# vim: background=dark
+
+unset cloudpv
+unset cloudsource
+unset hacloud
+unset NOQACROWBARDOWNLOAD
+unset PARALLEL
+unset TESTHEAD
+###############################
+
+echo "Starting mkcloud on $(date)"
+
+export automationrepo=~/automation
+
+#mirrorip=192.168.122.1
+
+#export clouddata=${mirrorip}
+#export susedownload=${mirrorip}
+#export distsuse=${mirrorip}
+#export smturl="http://${susedownload}/suse/update/build.suse.de"
+#export want_cloud7_iso_path=suse/iso
+
+export ntpserver=pool.ntp.org
+#export cloudsource=GM6+up
+export cloudsource=develcloud7
+export libvirt_type=kvm
+export networkingplugin=openvswitch
+export networkingmode=vxlan
+export storage_method=none
+export TESTHEAD=1 # Use Media from Devel:Cloud:Staging and add test update repositories
+export nodenumber=5 # Number of nodes (Admin Node not counted)
+#export nodenumbercompute=1
+#export want_tempest=1
+#export tempestoptions="-t -s"
+#export tempestoptions="--regex '^monasca_tempest_tests.tests.api'"
+#export ostestroptions=""
+#export want_horizon_integration_test=1
+#export want_sles12sp2=1
+#export want_sles12sp1_admin=1
+export upgrade_cloudsource=develcloud7
+#export hacloud=1 # For HA Cloud (Disabled by default)
+#export clusterconfig="data+services+network=2" # For three node clusters.
+export vcpus=2
+#export want_all_ssl=1
+#export net_admin=192.168.124
+#export net_fixed=192.168.130
+#export net_public=192.168.122
+#export net_storage=192.168.125
+#export net_sdn=192.168.130
+#export vlan_storage=200
+#export vlan_public=300
+#export vlan_fixed=500
+#export vlan_sdn=400
+export want_node_aliases="controller=1,network=1,compute=2,storage=1"
+export want_node_roles="controller=1,network=1,compute=2,storage=1"
+#export scenario="cloud7-4nodes-compute-ha.yml"
+export nics=3
+#export want_ceph=1
+#export want_swift=1
+export want_magnum_proposal=1
+#export want_barbican=1
+#export want_sahara=1
+#export want_murano=1
+#export want_monasca_proposal=1
+#export want_aodh_proposal=1
+export want_nodesupgrade=1
+#export want_ping_running_instances=1
+
+export want_all_debug=1
+export debug_qa_crowbarsetup=1
+export debug_mkcloud=1
+export debug_step=1
+export debug=0
+#export admin_node_memory=2000000 # Bytes (2GB default)
+#export adminvcpus=1 # Default 1 vcpu
+#export controller_node_memory=2000000 # Bytes (2GB Default)
+#export compute_node_memory=2000000 # Bytes (2GB Default)
+#export computenode_hdd_size=50
+#export vcpus=1
+#export cephvolumenumber=2 # By default 1. Extra HDD for Cinder volumes even without CEPH enabled.
+#export adminnode_hdd_size=60
+
+# allocated_cloud is cloudnumber -4, we are doing some calculations to set up
+# network etc with that number
+# cloudnumber -4
+
+#export want_test_updates=1
+
+#export want_neutronsles12=1
+#export want_mtu_size=2000
+
+allocated_cloud=1
+
+# Use standard upstream mkcloud
+#mkcloude $allocated_cloud mkcloud "$@"
+
+~/automation/scripts/mkcloudhost/mkcloude $allocated_cloud ~/automation/scripts/mkcloud "$@"

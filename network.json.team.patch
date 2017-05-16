@@ -1,0 +1,37 @@
+--- network.json.original	2017-05-17 09:48:35.539266437 -0600
++++ network.json	2017-05-17 09:48:35.559266603 -0600
+@@ -6,20 +6,19 @@
+                     "conduit_list": {
+                         "intf0": {
+                             "if_list": [
+-                                "1g1",
+-                                "1g2"
++                                "1g1"
+                             ]
+                         },
+                         "intf1": {
+                             "if_list": [
+-                                "1g1",
+-                                "1g2"
++                                "1g2",
++                                "1g3"
+                             ]
+                         },
+                         "intf2": {
+                             "if_list": [
+-                                "1g1",
+-                                "1g2"
++                                "1g2",
++                                "1g3"
+                             ]
+                         }
+                     },
+@@ -173,7 +172,7 @@
+                     "pattern": "product"
+                 }
+             ],
+-            "mode": "single",
++            "mode": "team",
+             "networks": {
+                 "admin": {
+                     "add_bridge": false,
