@@ -23,7 +23,7 @@ systemctl restart lvm2-lvmetad.service
 mkdir -p ~/cloud.d
 cat > ~/cloud.d/cloudrc.host <<EOF
 export mkcloudhostid=p
-export vcloudname=v${mkcloudhostid}
+export vcloudname=v\${mkcloudhostid}
 EOF
 
 mkdir -p ~/.ssh
