@@ -807,6 +807,7 @@ shutdown_cluster() {
         wait_for_domstate ${cloud}-node-${i} off
     done
     wait_for_domstate ${cloud}-admin off
+    cleanup_networks
 }
 
 suspend_cluster() {
@@ -859,16 +860,30 @@ cleanup_networks() {
             --jump ACCEPT || true
     fi
 
+    iptables --table nat --delete POSTROUTING \
+        -s ${PUBLIC_NETWORK}.0/24 \
+        ! -d ${PUBLIC_NETWORK}.0/24 -j MASQUERADE || true
+
     # Delete and insert to make sure that rule is the first one.
     iptables \
         --delete FORWARD \
         --destination 192.168.0.0/16 \
         --jump ACCEPT || true
 
-    iptables \
-        --insert FORWARD 1 \
-        --destination 192.168.0.0/16 \
-        --jump ACCEPT
+    iptables --delete FORWARD --destination ${PUBLIC_NETWORK}.0/24 \
+        --out-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} -m conntrack \
+        --ctstate RELATED,ESTABLISHED --jump ACCEPT || true
+    iptables --delete FORWARD --source ${PUBLIC_NETWORK}.0/24 \
+        --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} --jump ACCEPT || true
+
+    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol udp -m udp --dport 53 --jump ACCEPT || true
+    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol tcp -m tcp --dport 53 --jump ACCEPT || true
+    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol udp -m udp --dport 67 --jump ACCEPT || true
+    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol tcp -m tcp --dport 67 --jump ACCEPT || true
 
     if $(virsh net-info ${cloud}-admin > /dev/null 2>&1); then
         echo "Removing ${cloud}-admin"
@@ -881,6 +896,8 @@ cleanup_networks() {
 
     virsh net-list --all
     iptables --list INPUT --verbose --numeric --line-numbers
+    iptables --list FORWARD --verbose --numeric --line-numbers
+    iptables --table nat --list POSTROUTING --verbose --numeric --line-numbers
 }
 
 cleanup() {
@@ -977,12 +994,43 @@ EOF
         dev ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} || exit
     ip link set ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} up || exit
 
+    # Delete and insert to make sure that rule is the first one.
+    iptables \
+        --delete FORWARD \
+        --destination 192.168.0.0/16 \
+        --jump ACCEPT || true
+
+    iptables \
+        --insert FORWARD 1 \
+        --destination 192.168.0.0/16 \
+        --jump ACCEPT
+
+    iptables --insert FORWARD 1 --destination ${PUBLIC_NETWORK}.0/24 \
+        --out-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} -m conntrack \
+        --ctstate RELATED,ESTABLISHED --jump ACCEPT
+    iptables --insert FORWARD 1 --source ${PUBLIC_NETWORK}.0/24 \
+        --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} --jump ACCEPT
+
+    iptables --insert INPUT 1 --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol udp -m udp --dport 53 --jump ACCEPT
+    iptables --insert INPUT 1 --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol tcp -m tcp --dport 53 --jump ACCEPT
+    iptables --insert INPUT 1 --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol udp -m udp --dport 67 --jump ACCEPT
+    iptables --insert INPUT 1 --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+        --protocol tcp -m tcp --dport 67 --jump ACCEPT
+
+    iptables --table nat --insert POSTROUTING 1 \
+        -s ${PUBLIC_NETWORK}.0/24 \
+        ! -d ${PUBLIC_NETWORK}.0/24 -j MASQUERADE
+
     virsh net-dumpxml ${cloud}-admin
     ip -d addr show ${BRIDGE_DEV}
     ip -d addr show ${BRIDGE_DEV}-nic
     ip -d addr show ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID}
     iptables --list INPUT --verbose --numeric --line-numbers
     iptables --list FORWARD --verbose --numeric --line-numbers
+    iptables --table nat --list POSTROUTING --verbose --numeric --line-numbers
     virsh net-list --all
 }
 
@@ -1060,6 +1108,7 @@ prepare_admin() {
     copy_to_admin suse-bashrc ${CLOUDUSER}@${cloud}-admin:.bashrc || exit
     copy_to_admin vimrc ${CLOUDUSER}@${cloud}-admin:.vimrc || exit
     copy_to_admin screenrc ${CLOUDUSER}@${cloud}-admin:.screenrc || exit
+    copy_to_admin start-screen-session.sh ${CLOUDUSER}@${cloud}-admin: || exit
     on_admin "mkdir -p ~/.vim/{backup,swap,undo}" || exit
 
     if [[ ${CLOUDUSER} != root ]]; then
