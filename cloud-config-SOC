@@ -1,6 +1,7 @@
 # vim: syntax=sh
 
 cloud=SOC
+cloud_number=1
 update_repos=0
 debug_setup=1
 CLOUDUSER=root

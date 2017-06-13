@@ -37,6 +37,16 @@ if [[ ${update_repos} = 1 ]]; then
     ./update-repos.sh
 fi
 
+# Create MAC address based on cloud number (which has to be unique on the
+# host), node number (admin is node 0) and nic number on node.
+get_mac() {
+    local cloud=$1
+    local node=$2
+    local nic=$3
+
+    echo 52:54:00:$(printf "%x" ${cloud}):$(printf "%x" ${node}):$(printf "%x" ${nic})
+}
+
 on_admin() {
     if [[ $# -eq 0 ]]; then
         cmd=
@@ -121,6 +131,23 @@ wait_for_crowbar() {
     false
 }
 
+wait_for_node() {
+    local name=$1
+    local node_ready=0
+    local i
+    for i in $(seq 1000); do
+        if $(on_admin "crowbar machines show ${name} state | grep -q '^ready$'"); then
+            node_ready=1
+            break
+        fi
+        on_admin "timeout 10s sudo tail -f /var/log/crowbar/production.log" || true
+    done
+    if [[ ${node_ready} -ne 1 ]]; then
+        echo "node ${name} did not transition to ready"
+        exit 1
+    fi
+}
+
 wait_for_nodes() {
     local NS=($(on_admin "crowbarctl node list --plain" | grep -v admin | awk '{print $1}'))
     echo "found ${#NS[@]} nodes"
@@ -171,6 +198,12 @@ wait_for_domstate() {
 create_vol() {
     local name=$1
     local size=$2
+
+    if [[ $# -gt 2 ]]; then
+        local pool=${3}
+    else
+        local pool=${pool}
+    fi
 
     if $(virsh vol-info ${name} --pool ${pool} > /dev/null); then
         virsh vol-delete ${name} --pool ${pool}
@@ -523,6 +556,23 @@ EOF
     on_admin "crowbarctl proposal commit magnum default"
 }
 
+monasca_proposal() {
+    on_admin "cat > monasca.yml" <<EOF
+---
+proposals:
+- barclamp: monasca
+  attributes:
+  deployment:
+    elements:
+      monasca-server:
+      - "@@controller@@"
+      monasca-agent:
+      - "@@controller@@"
+EOF
+    on_admin "crowbar_batch import monasca.yml"
+    on_admin "crowbarctl proposal commit monasca default"
+}
+
 mount_disk() {
     local DISKNAME=$1
     local MOUNTPOINT=$(mktemp -d)
@@ -743,10 +793,14 @@ zypper patch --no-confirm
 export STY="dummy"
 
 chmod a+x crowbar_register
-./crowbar_register --force --gpg-auto-import-keys --no-gpg-checks
+while [[ ! -d /var/log/crowbar/crowbar_join ]]; do
+    ./crowbar_register --force --gpg-auto-import-keys --no-gpg-checks
+done
 
 # We don't want to run this again on reboot.
 systemctl disable register.service
+
+reboot
 EOF
     chmod 755 ${MOUNTPOINT}/root/register.sh
 
@@ -756,7 +810,7 @@ Description=Register this node
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/sleep 60
+ExecStart=/usr/bin/sleep 80
 ExecStart=/root/register.sh
 
 [Install]
@@ -775,7 +829,7 @@ clone_vol() {
     local to_pool=$3
     local to_vol=$4
 
-    local TMP=$(mktemp vol-XXXXXX.xml)
+    local TMP=$(mktemp vol-XXXXXXXX.xml)
     cat > ${TMP} <<EOF
 <volume type='file'>
   <name>${to_vol}</name>
@@ -1034,6 +1088,12 @@ EOF
     virsh net-list --all
 }
 
+clone_volume() {
+    local from_vol=$1
+    local to_vol=$2
+    qemu-img convert -f qcow2 -O qcow2 -o compat=0.10 ${from_vol} ${to_vol}
+}
+
 create_admin() {
     local HOSTS_ENTRY="${ADMIN_NETWORK}.10 ${cloud}-admin"
     if $(grep --quiet ${ADMIN_NETWORK}.10 /etc/hosts); then
@@ -1062,10 +1122,8 @@ create_admin() {
         CLOUDCD=--disk device=cdrom,path=${CD2}
     fi
 
-    local NETWORK="network=${cloud}-admin"
-    if [[ ${ADMIN_MAC} ]]; then
-        NETWORK="${NETWORK},mac=${ADMIN_MAC}"
-    fi
+    local NETWORK="network=${cloud}-admin,mac=$(get_mac ${cloud_number} 0 0)"
+
     virt-install \
         --os-variant sles12sp1 \
         --cpu mode=host-passthrough \
@@ -1131,13 +1189,16 @@ prepare_admin() {
     on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SLES12-${SLESVERSION}-Pool    SLES12-${SLESVERSION}-Pool"
     on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SLES12-${SLESVERSION}-Updates SLES12-${SLESVERSION}-Updates"
 
+    on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/Devel:/Cloud:/7/SLE_12_SP2 Cloud"
+    on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/Devel:/Cloud:/7:/Staging/SLE_12_SP2 Staging"
+
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-5-Pool    SUSE-OpenStack-Cloud-5-Pool"
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-5-Updates SUSE-OpenStack-Cloud-5-Updates"
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-6-Pool    SUSE-OpenStack-Cloud-6-Pool"
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-6-Updates SUSE-OpenStack-Cloud-6-Updates"
 
     on_admin "sudo zypper repos --uri"
-    on_admin_interactive "sudo zypper refresh"
+    on_admin_interactive "sudo zypper --gpg-auto-import-keys refresh"
     on_admin_interactive "sudo zypper update --no-confirm"
     on_admin_interactive "sudo zypper patch --no-confirm"
 
@@ -1337,8 +1398,12 @@ create_nodes() {
 
         clone_vol ${ADMIN_BASE_POOL} ${ADMIN_BASE_IMAGE} \
             ${pool} ${cloud}-node-${i}-1.qcow2 || exit
+        inject_ssh_key ${cloud}-node-${i}-1.qcow2
+        inject_crowbar_register ${cloud}-node-${i}-1.qcow2
+        create_vol ${cloud}-node-${i}-2.qcow2 ${NODES_DISK_SIZE} cloud-pool
 
-        create_vol ${cloud}-node-${i}-2.qcow2 ${NODES_DISK_SIZE}
+        #local BOOTORDER=network,hd
+        local BOOTORDER=hd
 
         virt-install \
             --os-variant sles12sp1 \
@@ -1347,12 +1412,18 @@ create_nodes() {
             --memory ${NODES_MEMORY} \
             --check path_in_use=off \
             --disk vol=${pool}/${cloud}-node-${i}-1.qcow2 \
-            --disk vol=${pool}/${cloud}-node-${i}-2.qcow2 \
+            --disk vol=cloud-pool/${cloud}-node-${i}-2.qcow2 \
             ${NETWORK} \
-            --boot network,hd,menu=on \
+            --boot ${BOOTORDER} \
             --noautoconsole
 
-        on_admin "timeout 2m sudo tail -f /var/log/crowbar/production.log" || true
+        local TMP=$(mktemp dom-XXXXXXXX.xml)
+        virsh dumpxml ${cloud}-node-${i} > ${TMP}
+        sed -i -e "s:<boot.*$:<boot dev='network'/><boot dev='hd'/>:" ${TMP}
+        virsh define ${TMP}
+        rm -v ${TMP}
+
+        on_admin "timeout 30s sudo tail -f /var/log/crowbar/production.log" || true
     done
 
     for i in $(seq ${NODES}); do
@@ -1365,8 +1436,12 @@ create_nodes() {
             on_admin "timeout 15s sudo tail -f /var/log/crowbar/production.log" || true
         done
         on_admin "crowbarctl node rename ${CROWBAR_NAME} ${cloud}-node-${i}"
-        on_admin "crowbarctl node allocate ${cloud}-node-${i}"
     done
+
+    #for i in $(seq ${NODES}); do
+    #    on_admin "crowbarctl node allocate ${cloud}-node-${i}"
+    #    wait_for_node ${cloud}-node-${i}
+    #done
 
     for i in $(seq ${NODES}); do
         local MAC=$(virsh dumpxml ${cloud}-node-${i} | grep "mac address" | head -n1 | sed -e "s/^.*'\(.*\)'.*/\1/")
@@ -1489,11 +1564,11 @@ register_nodes_fast() {
     for i in $(seq ${NODES}); do
         wait_for_domstate ${cloud}-node-${i} off
 
-        local TMP=$(mktemp domain-XXXXXX.xml)
+        local TMP=$(mktemp domain-XXXXXXXX.xml)
         virsh dumpxml --inactive --security-info ${cloud}-node-${i} > ${TMP}
 
         # Change boot order.
-        local TMP2=$(mktemp domain-XXXXXX.xml)
+        local TMP2=$(mktemp domain-XXXXXXXX.xml)
         sed -e "s/<boot dev='hd'/<boot dev='1'/" \
             -e "s/<boot dev='network'/<boot dev='2'/" \
             ${TMP} > ${TMP2}
@@ -1561,6 +1636,36 @@ restart_cluster() {
     wait_for_nodes
 }
 
+snapshot_cluster() {
+    local snapshot_name=$(mktemp --dry-run snapshot-XXXXXXXX)
+
+    shutdown_cluster
+
+    virsh snapshot-create-as ${cloud}-admin \
+        --name "${snapshot_name}" \
+        --description "Cluster snapshot"
+
+    for i in $(seq ${NODES}); do
+        virsh snapshot-create-as ${cloud}-node-${i} \
+            --name "${snapshot_name}" \
+            --description "Cluster snapshot"
+    done
+
+    start_admin
+    wait_for_crowbar
+
+    start_nodes
+    wait_for_nodes
+}
+
+list_snapshots() {
+    local i
+    virsh snapshot-list ${cloud}-admin
+    for i in $(seq ${NODES}); do
+        virsh snapshot-list ${cloud}-node-${i}
+    done
+}
+
 apply_proposal() {
     database_proposal
     rabbitmq_proposal
@@ -1572,6 +1677,17 @@ apply_proposal() {
     horizon_proposal
     heat_proposal
     magnum_proposal
+    monasca_proposal
+}
+
+instonly() {
+    cleanup
+    create_networks
+    create_admin
+    prepare_admin
+    create_nodes
+    assign_roles
+    register_nodes
 }
 
 plain() {
@@ -1580,8 +1696,8 @@ plain() {
     create_admin
     prepare_admin
     create_nodes
-    register_nodes
     assign_roles
+    register_nodes
     apply_proposal
 }
 
@@ -1607,6 +1723,8 @@ shutdown_cluster
 restart_cluster
 suspend_cluster
 resume_cluster
+snapshot_cluster
+list_snapshots
 database_proposal
 rabbitmq_proposal
 keystone_proposal
@@ -1617,6 +1735,8 @@ nova_proposal
 horizon_proposal
 heat_proposal
 magnum_proposal
+monasca_proposal
+instonly
 plain
 EOF
 }
@@ -1626,6 +1746,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 while [[ $# -gt 0 ]]; do
-    ${1}
+    step=${1}
     shift
+    ${step}
 done
