@@ -812,6 +812,7 @@ Description=Register this node
 Type=oneshot
 ExecStart=/usr/bin/sleep 80
 ExecStart=/root/register.sh
+WorkingDirectory=/root
 
 [Install]
 WantedBy=multi-user.target
@@ -823,7 +824,22 @@ EOF
     umount_disk ${MOUNTPOINT}
 }
 
-clone_vol() {
+clone_vol_backing() {
+    local from_pool=$1
+    local from_vol=$2
+    local to_pool=$3
+    local to_vol=$4
+
+    local from_path=$(virsh vol-path ${from_vol} ${from_pool})
+    local to_path=$(virsh pool-dumpxml ${to_pool} | grep path | sed -e 's:<[/]*path>::g')
+
+    qemu-img create -f qcow2 \
+        -b ${from_path} \
+        ${to_path}/${to_vol}
+    virsh pool-refresh ${to_pool}
+}
+
+clone_vol_clone() {
     local from_pool=$1
     local from_vol=$2
     local to_pool=$3
@@ -843,6 +859,10 @@ EOF
         --inputpool ${from_pool} ${from_vol} || exit
 
     rm -v ${TMP}
+}
+
+clone_vol() {
+    clone_vol_backing "$@"
 }
 
 shutdown_node() {
@@ -894,59 +914,57 @@ cleanup_networks() {
     local BRIDGE_DEV=$(virsh net-info ${cloud}-public \
         | grep Bridge | awk '{print $2}')
 
-    if [[ -n $BRIDGE_DEV ]]; then
+    if [[ -n ${BRIDGE_DEV} ]]; then
         ip link set ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} down
         ip link delete ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID}
+    fi
+
+    if $(virsh net-info ${cloud}-public > /dev/null 2>&1); then
+        echo "Removing ${cloud}-public"
+        virsh net-destroy ${cloud}-public || exit
     fi
 
     BRIDGE_DEV=$(virsh net-info ${cloud}-admin \
         | grep Bridge | awk '{print $2}')
 
-    if [[ -n $BRIDGE_DEV ]]; then
+    if [[ -n ${BRIDGE_DEV} ]]; then
         ip link set ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} down
         ip link delete ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID}
-    fi
 
-    if [[ -n $BRIDGE_DEV ]]; then
         iptables \
             --delete INPUT -i ${BRIDGE_DEV} \
             --destination ${ADMIN_NETWORK}.0/24 \
             --jump ACCEPT || true
+
+        iptables --delete FORWARD --destination ${PUBLIC_NETWORK}.0/24 \
+            --out-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} -m conntrack \
+            --ctstate RELATED,ESTABLISHED --jump ACCEPT || true
+        iptables --delete FORWARD --source ${PUBLIC_NETWORK}.0/24 \
+            --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} --jump ACCEPT || true
+
+        iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+            --protocol udp -m udp --dport 53 --jump ACCEPT || true
+        iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+            --protocol tcp -m tcp --dport 53 --jump ACCEPT || true
+        iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+            --protocol udp -m udp --dport 67 --jump ACCEPT || true
+        iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
+            --protocol tcp -m tcp --dport 67 --jump ACCEPT || true
     fi
-
-    iptables --table nat --delete POSTROUTING \
-        -s ${PUBLIC_NETWORK}.0/24 \
-        ! -d ${PUBLIC_NETWORK}.0/24 -j MASQUERADE || true
-
-    # Delete and insert to make sure that rule is the first one.
-    iptables \
-        --delete FORWARD \
-        --destination 192.168.0.0/16 \
-        --jump ACCEPT || true
-
-    iptables --delete FORWARD --destination ${PUBLIC_NETWORK}.0/24 \
-        --out-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} -m conntrack \
-        --ctstate RELATED,ESTABLISHED --jump ACCEPT || true
-    iptables --delete FORWARD --source ${PUBLIC_NETWORK}.0/24 \
-        --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} --jump ACCEPT || true
-
-    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
-        --protocol udp -m udp --dport 53 --jump ACCEPT || true
-    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
-        --protocol tcp -m tcp --dport 53 --jump ACCEPT || true
-    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
-        --protocol udp -m udp --dport 67 --jump ACCEPT || true
-    iptables --delete INPUT --in-interface ${BRIDGE_DEV}.${PUBLIC_NETWORK_ID} \
-        --protocol tcp -m tcp --dport 67 --jump ACCEPT || true
 
     if $(virsh net-info ${cloud}-admin > /dev/null 2>&1); then
         echo "Removing ${cloud}-admin"
         virsh net-destroy ${cloud}-admin || exit
     fi
-    if $(virsh net-info ${cloud}-public > /dev/null 2>&1); then
-        echo "Removing ${cloud}-public"
-        virsh net-destroy ${cloud}-public || exit
-    fi
+
+    iptables \
+        --delete FORWARD \
+        --destination 192.168.0.0/16 \
+        --jump ACCEPT || true
+
+    iptables --table nat --delete POSTROUTING \
+        -s ${PUBLIC_NETWORK}.0/24 \
+        ! -d ${PUBLIC_NETWORK}.0/24 -j MASQUERADE || true
 
     virsh net-list --all
     iptables --list INPUT --verbose --numeric --line-numbers
@@ -1094,6 +1112,14 @@ clone_volume() {
     qemu-img convert -f qcow2 -O qcow2 -o compat=0.10 ${from_vol} ${to_vol}
 }
 
+add_nfs_mount() {
+    local remote=$1
+    local local=$2
+
+    on_admin "sudo mkdir -p ${local}" || exit
+    on_admin "sudo bash -c 'echo ${remote} ${local} nfs ro 0 0 >> /etc/fstab'"
+}
+
 create_admin() {
     local HOSTS_ENTRY="${ADMIN_NETWORK}.10 ${cloud}-admin"
     if $(grep --quiet ${ADMIN_NETWORK}.10 /etc/hosts); then
@@ -1196,6 +1222,8 @@ prepare_admin() {
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-5-Updates SUSE-OpenStack-Cloud-5-Updates"
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-6-Pool    SUSE-OpenStack-Cloud-6-Pool"
     #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-6-Updates SUSE-OpenStack-Cloud-6-Updates"
+    #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-7-Pool    SUSE-OpenStack-Cloud-7-Pool"
+    #on_admin "sudo zypper addrepo --refresh http://${ADMIN_NETWORK}.1/suse/repos/x86_64/SUSE-OpenStack-Cloud-7-Updates SUSE-OpenStack-Cloud-7-Updates"
 
     on_admin "sudo zypper repos --uri"
     on_admin_interactive "sudo zypper --gpg-auto-import-keys refresh"
@@ -1286,31 +1314,36 @@ prepare_admin() {
         on_admin "sudo umount /mnt" || exit
     fi
 
-    on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Pool" || exit
-    on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLE12-${SLESVERSION}-HA-Pool \
-        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Pool nfs ro 0 0 >> /etc/fstab'"
-    on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Updates" || exit
-    on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLE12-${SLESVERSION}-HA-Updates \
-        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Updates nfs ro 0 0 >> /etc/fstab'"
+    add_nfs_mount \
+        ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLE12-${SLESVERSION}-HA-Pool \
+        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Pool
+    add_nfs_mount \
+        ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLE12-${SLESVERSION}-HA-Updates \
+        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLE12-${SLESVERSION}-HA-Updates
 
-    on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Pool" || exit
-    on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLES12-${SLESVERSION}-Pool \
-        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Pool nfs ro 0 0 >> /etc/fstab'"
-    on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Updates" || exit
-    on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLES12-${SLESVERSION}-Updates \
-        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Updates nfs ro 0 0 >> /etc/fstab'"
-    #on_admin "sudo rsync -av --delete-after rsync://${ADMIN_NETWORK}.1/cloud/repos/x86_64/SLES12-${SLESVERSION}-Pool /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/"    || exit
-    #on_admin "sudo rsync -av --delete-after rsync://${ADMIN_NETWORK}.1/cloud/repos/x86_64/SLES12-${SLESVERSION}-Updates /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/" || exit
+    add_nfs_mount \
+        ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLES12-${SLESVERSION}-Pool \
+        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Pool
+    add_nfs_mount \
+        ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SLES12-${SLESVERSION}-Updates \
+        /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SLES12-${SLESVERSION}-Updates
 
     if [[ ${want_cloud_pool} = 1 ]]; then
-        on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool" || exit
-        on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool \
-            /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool nfs ro 0 0 >> /etc/fstab'"
-        on_admin "sudo mkdir -p /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates" || exit
-        on_admin "sudo bash -c 'echo ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates \
-            /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates nfs ro 0 0 >> /etc/fstab'"
-        #on_admin "sudo rsync -av --delete-after rsync://${ADMIN_NETWORK}.1/cloud/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/"    || exit
-        #on_admin "sudo rsync -av --delete-after rsync://${ADMIN_NETWORK}.1/cloud/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/" || exit
+        if [[ ${want_staging} = 1 ]]; then
+            add_nfs_mount \
+                ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/Devel:/Cloud:/7/SLE_12_SP2 \
+                /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool
+            add_nfs_mount \
+                ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/Devel:/Cloud:/7:/Staging/SLE_12_SP2 \
+                /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates
+        else
+            add_nfs_mount \
+                ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool \
+                /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Pool
+            add_nfs_mount \
+                ${ADMIN_NETWORK}.1:/mnt/cloud/mirror/suse/repos/x86_64/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates \
+                /srv/tftpboot/suse-${LOCALSLESVERSION}/x86_64/repos/SUSE-OpenStack-Cloud-${CLOUDVERSION}-Updates
+        fi
     fi
 
     on_admin "sudo mount -a -v"
